@@ -1,5 +1,6 @@
 # 🌟 ビルド用ステージ
-FROM ruby:$RUBY_VERSION-slim-bullseye AS builder
+ARG RUBY_VERSION  # ✅ `FROM` の前に定義
+FROM ruby:${RUBY_VERSION}-slim-bullseye AS builder
 
 ARG BUNDLER_VERSION
 WORKDIR /usr/src/app
@@ -10,12 +11,13 @@ RUN gem install bundler:$BUNDLER_VERSION && \
     bundle install --deployment --without development test
 
 # Node.js & Yarn のインストール
-RUN apt-get update && apt-get install -y nodejs yarn && rm -rf /var/lib/apt/lists/*
-COPY package.json yarn.lock ./
-RUN yarn install --production
+RUN gem update --system && \
+    gem install bundler -v 2.3.26 && \
+    bundle install --deployment --without development test
 
 # 🌟 本番用ステージ
-FROM ruby:$RUBY_VERSION-slim-bullseye
+ARG RUBY_VERSION  # ✅ 本番用ステージでも `ARG` を定義
+FROM ruby:${RUBY_VERSION}-slim-bullseye
 
 ARG APP_ENV
 ENV RAILS_ENV=${APP_ENV} \
