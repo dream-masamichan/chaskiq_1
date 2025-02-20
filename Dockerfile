@@ -1,48 +1,72 @@
-ARG RUBY_VERSION
-FROM ruby:${RUBY_VERSION}-slim-bullseye
+# syntax=docker/dockerfile:1
+# check=error=true
 
-ARG APP_ENV
-ARG PG_MAJOR
-ARG NODE_MAJOR
-ARG BUNDLER_VERSION
-ARG YARN_VERSION
+# This Dockerfile is designed for production, not development. Use with Kamal or build'n'run by hand:
+# docker build -t app .
+# docker run -d -p 80:80 -e RAILS_MASTER_KEY=<value from config/master.key> --name app app
 
-# 必要なパッケージをインストール（Node.js & Yarn を含む）
-RUN apt-get update && apt-get install -y curl gnupg2 && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add - && \
-    echo "deb https://deb.nodesource.com/node_16.x bullseye main" > /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && apt-get install -y nodejs && \
-    npm install -g yarn@1.22.19
+# For a containerized dev environment, see Dev Containers: https://guides.rubyonrails.org/getting_started_with_devcontainer.html
 
-# 作業ディレクトリを設定
-WORKDIR /app
+# Make sure RUBY_VERSION matches the Ruby version in .ruby-version
+ARG RUBY_VERSION=3.3.7
+FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
 
-# 先に `package.json` と `yarn.lock` をコピー（キャッシュ活用のため）
-COPY package.json yarn.lock /app/
+# Rails app lives here
+WORKDIR /rails
 
-# Yarn のキャッシュをクリアしてから依存関係をインストール
-RUN yarn cache clean && yarn install --frozen-lockfile
+# Install base packages
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y curl libjemalloc2 libvips postgresql-client && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-# 先に `Gemfile` と `Gemfile.lock` をコピー（キャッシュを活用）
-COPY Gemfile Gemfile.lock /app/
+# Set production environment
+ENV RAILS_ENV="production" \
+    BUNDLE_DEPLOYMENT="1" \
+    BUNDLE_PATH="/usr/local/bundle" \
+    BUNDLE_WITHOUT="development"
 
-# Bundler のインストール
-RUN gem update --system && \
-    gem install bundler -v ${BUNDLER_VERSION} && \
-    bundle config set without 'development test' && \
-    bundle install --jobs=4 --retry=3
+# Throw-away build stage to reduce size of final image
+FROM base AS build
 
-# アプリケーションの全ファイルをコピー
-COPY . /app/
+# Install packages needed to build gems
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y build-essential git libpq-dev pkg-config && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-# `entrypoint.sh` の権限を設定
-RUN chmod +x /app/entrypoint.sh
+# Install application gems
+COPY Gemfile Gemfile.lock ./
+RUN bundle install && \
+    rm -rf ~/.bundle/ "${BUNDLE_PATH}"/ruby/*/cache "${BUNDLE_PATH}"/ruby/*/bundler/gems/*/.git && \
+    bundle exec bootsnap precompile --gemfile
 
-# ユーザー変更（root 回避）
-RUN adduser --disabled-password --gecos "" appuser
-RUN chown -R appuser:appuser /app
-USER appuser
+# Copy application code
+COPY . .
 
-# アプリの起動
-ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["bundle", "exec", "rails", "server"]
+# Precompile bootsnap code for faster boot times
+RUN bundle exec bootsnap precompile app/ lib/
+
+# Precompiling assets for production without requiring secret RAILS_MASTER_KEY
+RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
+
+
+
+
+# Final stage for app image
+FROM base
+
+# Copy built artifacts: gems, application
+COPY --from=build "${BUNDLE_PATH}" "${BUNDLE_PATH}"
+COPY --from=build /rails /rails
+
+# Run and own only the runtime files as a non-root user for security
+RUN groupadd --system --gid 1000 rails && \
+    useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash && \
+    chown -R rails:rails db log storage tmp
+USER 1000:1000
+
+# Entrypoint prepares the database.
+ENTRYPOINT ["/rails/bin/docker-entrypoint"]
+
+# Start server via Thruster by default, this can be overwritten at runtime
+EXPOSE 80
+CMD ["./bin/thrust", "./bin/rails", "server"]
