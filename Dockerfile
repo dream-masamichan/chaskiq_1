@@ -1,46 +1,41 @@
-# 🌟 ビルド用ステージ
-ARG RUBY_VERSION  # ✅ `FROM` の前に定義
-FROM ruby:${RUBY_VERSION}-slim-bullseye AS builder
-
-ARG BUNDLER_VERSION
-WORKDIR /usr/src/app
-
-COPY Gemfile Gemfile.lock ./
-
-RUN gem install bundler:$BUNDLER_VERSION && \
-    bundle install --deployment --without development test
-
-# Node.js & Yarn のインストール
-RUN gem update --system && \
-    gem install bundler -v 2.3.26 && \
-    bundle install --deployment --without development test
-
-# 🌟 本番用ステージ
-ARG RUBY_VERSION  # ✅ 本番用ステージでも `ARG` を定義
+ARG RUBY_VERSION
 FROM ruby:${RUBY_VERSION}-slim-bullseye
 
 ARG APP_ENV
-ENV RAILS_ENV=${APP_ENV} \
-    LANG=C.UTF-8 \
-    BUNDLE_JOBS=4 \
-    BUNDLE_RETRY=3 \
-    BUNDLE_APP_CONFIG=.bundle \
-    PATH="/app/bin:$PATH"
+ARG PG_MAJOR
+ARG NODE_MAJOR
+ARG BUNDLER_VERSION
+ARG YARN_VERSION
 
+# 必要なパッケージをインストール（Node.js & Yarn を含む）
+RUN apt-get update && apt-get install -y curl gnupg2 && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add - && \
+    echo "deb https://deb.nodesource.com/node_16.x bullseye main" > /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install -y nodejs && \
+    npm install -g yarn@1.22.19
+
+# 作業ディレクトリを設定
 WORKDIR /app
 
-# 必要なパッケージをインストール
-RUN apt-get update && apt-get install -y curl build-essential libpq-dev nodejs yarn && rm -rf /var/lib/apt/lists/*
+# 先に `package.json` と `yarn.lock` をコピー（キャッシュ活用のため）
+COPY package.json yarn.lock /app/
 
-# `vendor/bundle` と `node_modules` をコピー
-COPY --from=builder /usr/src/app/vendor/bundle /app/vendor/bundle
-COPY --from=builder /usr/src/app/node_modules /app/node_modules
+# Yarn のキャッシュをクリアしてから依存関係をインストール
+RUN yarn cache clean && yarn install --frozen-lockfile
 
-# アプリのソースコードをコピー
-COPY . ./
+# 先に `Gemfile` と `Gemfile.lock` をコピー（キャッシュを活用）
+COPY Gemfile Gemfile.lock /app/
 
-# `entrypoint.sh` を追加
-COPY entrypoint.sh /app/entrypoint.sh
+# Bundler のインストール
+RUN gem update --system && \
+    gem install bundler -v ${BUNDLER_VERSION} && \
+    bundle config set without 'development test' && \
+    bundle install --jobs=4 --retry=3
+
+# アプリケーションの全ファイルをコピー
+COPY . /app/
+
+# `entrypoint.sh` の権限を設定
 RUN chmod +x /app/entrypoint.sh
 
 # ユーザー変更（root 回避）
@@ -48,5 +43,6 @@ RUN adduser --disabled-password --gecos "" appuser
 RUN chown -R appuser:appuser /app
 USER appuser
 
+# アプリの起動
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["bundle", "exec", "rails", "server"]
